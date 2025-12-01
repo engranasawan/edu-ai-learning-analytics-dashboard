@@ -10,6 +10,7 @@ from lime.lime_tabular import LimeTabularExplainer
 import matplotlib.pyplot as plt
 import seaborn as sns
 from collections import OrderedDict
+import xgboost as xgb
 
 # ============================================
 # Streamlit basic config
@@ -17,7 +18,7 @@ from collections import OrderedDict
 st.set_page_config(
     page_title="Learning Analytics – HTBT & XGBoost Dashboard",
     layout="wide",
-    page_icon="📊"
+    page_icon="📊",
 )
 
 # ============================================
@@ -135,6 +136,7 @@ class HTBT(nn.Module):
         super().__init__()
         self.seq_len = seq_len
 
+        # Project daily scalar activity to d_model
         self.seq_proj = nn.Sequential(
             nn.Linear(1, d_model),
             nn.ReLU(),
@@ -151,12 +153,14 @@ class HTBT(nn.Module):
         )
         self.seq_encoder = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
 
+        # Static feature encoder
         self.static_proj = nn.Sequential(
             nn.Linear(n_static, d_model),
             nn.ReLU(),
             nn.LayerNorm(d_model),
         )
 
+        # Cross-attention
         self.cross_attn = nn.MultiheadAttention(
             embed_dim=d_model,
             num_heads=n_heads,
@@ -164,6 +168,7 @@ class HTBT(nn.Module):
             batch_first=True,
         )
 
+        # Fusion + classifier
         self.fusion_mlp = nn.Sequential(
             nn.Linear(d_model * 2, d_ff),
             nn.ReLU(),
@@ -212,7 +217,95 @@ class HTBT(nn.Module):
 
 
 # ============================================
-# Cached model loaders
+# Simplified feature subset & helpers
+# ============================================
+SIMPLIFIED_FEATURES = OrderedDict(
+    [
+        ("total_clicks", "Total VLE Activity"),
+        ("avg_clicks_per_visit", "Average Engagement per Visit"),
+        ("active_days", "Active Study Days"),
+        ("weighted_score", "Weighted Assessment Score"),
+        ("avg_score", "Average Score"),
+        ("performance_trend", "Performance Trend Over Time"),
+        ("study_duration", "Study Duration"),
+        ("engagement_efficiency", "Engagement Efficiency"),
+        ("cbii", "Cognitive–Behavioural Index (CBII)"),
+        ("tpi", "Temporal Persistence Index (TPI)"),
+        ("dropout_risk_proxy", "Dropout Risk Indicator"),
+        ("activity_entropy", "Study Pattern Entropy"),
+    ]
+)
+
+SEQ_LEN = 30  # 30-day temporal window
+
+
+def random_default(feature_name: str) -> float:
+    """
+    Generate a plausible random default for each feature type.
+    Called at runtime -> changes with new page loads.
+    """
+    name = feature_name.lower()
+    if "total_clicks" in name:
+        return float(np.random.randint(100, 3000))
+    if "avg_clicks_per_visit" in name:
+        return float(np.random.uniform(3, 80))
+    if "active_days" in name:
+        return float(np.random.randint(3, 60))
+    if "weighted_score" in name or "avg_score" in name:
+        return float(np.random.uniform(30, 95))
+    if "trend" in name:
+        return float(np.random.uniform(-8, 8))
+    if "engagement_efficiency" in name:
+        return float(np.random.uniform(0.05, 3.0))
+    if "cbii" in name:
+        return float(np.random.uniform(0.0, 1.0))
+    if "tpi" in name:
+        return float(np.random.uniform(0.0, 60.0))
+    if "dropout_risk_proxy" in name:
+        return float(np.random.uniform(0.0, 2.0))
+    if "entropy" in name:
+        return float(np.random.uniform(0.0, 3.2))
+    if "duration" in name:
+        return float(np.random.uniform(20, 260))
+    return float(np.random.uniform(0.0, 1.0))
+
+
+def sample_background(all_feature_names, n_samples=400):
+    """
+    Synthetic background for SHAP/LIME when training data are not loaded.
+    """
+    bg = np.zeros((n_samples, len(all_feature_names)), dtype=np.float32)
+    for j, fname in enumerate(all_feature_names):
+        if fname in SIMPLIFIED_FEATURES:
+            vals = [random_default(fname) for _ in range(n_samples)]
+            bg[:, j] = np.array(vals, dtype=np.float32)
+        else:
+            bg[:, j] = 0.0
+    return bg
+
+
+def risk_label_from_probs(probs, classes):
+    """
+    Map predicted class probabilities to a simple risk signal.
+    Assumes lower index = higher risk.
+    """
+    pred_idx = int(np.argmax(probs))
+    conf = float(np.max(probs))
+
+    if pred_idx == 0:
+        label = "High Risk"
+        css = "risk-pill risk-high"
+    elif pred_idx == 1:
+        label = "Moderate Risk"
+        css = "risk-pill risk-med"
+    else:
+        label = "Lower Risk"
+        css = "risk-pill risk-low"
+    return label, css, conf, pred_idx
+
+
+# ============================================
+# Cached model loaders & explainers
 # ============================================
 @st.cache_resource
 def load_xgb_model():
@@ -239,116 +332,61 @@ def load_htbt_model(n_static, seq_len, num_classes):
     return model
 
 
-# ============================================
-# Helper functions
-# ============================================
-def risk_label_from_probs(probs, classes):
-    pred_idx = int(np.argmax(probs))
-    conf = float(np.max(probs))
+@st.cache_resource
+def get_model_and_metadata():
+    """
+    Load XGBoost model and infer feature names and class labels.
+    """
+    xgb_model = load_xgb_model()
 
-    # assumes lower index = higher risk
-    if pred_idx == 0:
-        label = "High Risk"
-        css = "risk-pill risk-high"
-    elif pred_idx == 1:
-        label = "Moderate Risk"
-        css = "risk-pill risk-med"
+    # Determine classes
+    if hasattr(xgb_model, "classes_") and xgb_model.classes_ is not None:
+        xgb_classes = xgb_model.classes_
     else:
-        label = "Lower Risk"
-        css = "risk-pill risk-low"
-    return label, css, conf, pred_idx
+        # Fallback to 4 ordered classes if metadata are missing
+        xgb_classes = np.arange(4)
+
+    # Determine feature names as used in training
+    booster = xgb_model.get_booster()
+    if booster is not None and booster.feature_names is not None:
+        all_features = list(booster.feature_names)
+    elif hasattr(xgb_model, "feature_names_in_"):
+        all_features = list(xgb_model.feature_names_in_)
+    else:
+        # Very defensive fallback: use simplified subset only
+        all_features = list(SIMPLIFIED_FEATURES.keys())
+
+    return xgb_model, xgb_classes, all_features
 
 
-# Simplified, user-facing subset of features
-SIMPLIFIED_FEATURES = OrderedDict([
-    ("total_clicks", "Total VLE Activity"),
-    ("avg_clicks_per_visit", "Average Engagement per Visit"),
-    ("active_days", "Active Study Days"),
-    ("weighted_score", "Weighted Assessment Score"),
-    ("avg_score", "Average Score"),
-    ("performance_trend", "Performance Trend Over Time"),
-    ("study_duration", "Study Duration"),
-    ("engagement_efficiency", "Engagement Efficiency"),
-    ("cbii", "Cognitive–Behavioural Index (CBII)"),
-    ("tpi", "Temporal Persistence Index (TPI)"),
-    ("dropout_risk_proxy", "Dropout Risk Indicator"),
-    ("activity_entropy", "Study Pattern Entropy"),
-])
+@st.cache_resource
+def get_explainers(xgb_model, all_features):
+    """
+    Instantiate SHAP and LIME explainers with synthetic background data.
+    Cached for efficiency.
+    """
+    background = sample_background(all_features, n_samples=400)
 
-SEQ_LEN = 30
+    # SHAP explainer
+    try:
+        shap_explainer = shap.TreeExplainer(xgb_model)
+    except Exception:
+        shap_explainer = None
 
+    # LIME explainer
+    try:
+        lime_explainer = LimeTabularExplainer(
+            training_data=background,
+            feature_names=all_features,
+            class_names=[str(c) for c in getattr(xgb_model, "classes_", np.arange(4))],
+            discretize_continuous=True,
+            random_state=42,
+        )
+    except Exception:
+        lime_explainer = None
 
-def random_default(feature_name: str) -> float:
-    """Generate a plausible random default for each feature type.
-    Called at runtime -> changes with new sessions/reloads."""
-    name = feature_name.lower()
-    if "click" in name or "days" in name:
-        return float(np.random.randint(20, 800))
-    if "score" in name:
-        return float(np.random.uniform(30, 90))
-    if "trend" in name:
-        return float(np.random.uniform(-5, 5))
-    if "engagement_efficiency" in name:
-        return float(np.random.uniform(0.1, 2.5))
-    if "cbii" in name:
-        return float(np.random.uniform(0.0, 1.0))
-    if "tpi" in name:
-        return float(np.random.uniform(0.0, 40.0))
-    if "dropout_risk_proxy" in name:
-        return float(np.random.uniform(0.0, 1.5))
-    if "entropy" in name:
-        return float(np.random.uniform(0.0, 3.0))
-    if "duration" in name:
-        return float(np.random.uniform(20, 250))
-    return 0.0
+    return shap_explainer, lime_explainer, background
 
-
-def sample_background(all_feature_names, n_samples=300):
-    """Synthetic background for SHAP/LIME (since training data are not loaded here)."""
-    bg = np.zeros((n_samples, len(all_feature_names)), dtype=np.float32)
-    for j, fname in enumerate(all_feature_names):
-        if fname in SIMPLIFIED_FEATURES:
-            vals = [random_default(fname) for _ in range(n_samples)]
-            bg[:, j] = np.array(vals)
-        else:
-            bg[:, j] = 0.0
-    return bg
-
-
-# ============================================
-# Load models & set up explainers
-# ============================================
-def load_xgb_model():
-    model = xgb.XGBClassifier()
-    model.load_model("xgb_final.json")
-    return model
-xgb_classes = getattr(xgb_model, "classes_", np.arange(4))
-
-# Full static feature list as seen by the model
-if hasattr(xgb_model, "feature_names_in_"):
-    ALL_FEATURES = list(xgb_model.feature_names_in_)
-else:
-    # Fallback if not present
-    ALL_FEATURES = list(SIMPLIFIED_FEATURES.keys())
-
-num_static_features = len(ALL_FEATURES)
-num_classes = len(xgb_classes)
-
-htbt_model = load_htbt_model(
-    n_static=num_static_features,
-    seq_len=SEQ_LEN,
-    num_classes=num_classes,
-)
-
-background_data = sample_background(ALL_FEATURES, n_samples=300)
-shap_explainer = shap.TreeExplainer(xgb_model)
-lime_explainer = LimeTabularExplainer(
-    training_data=background_data,
-    feature_names=ALL_FEATURES,
-    class_names=[str(c) for c in xgb_classes],
-    discretize_continuous=True,
-    random_state=42,
-)
 
 # ============================================
 # Header
@@ -358,13 +396,24 @@ st.markdown(
     unsafe_allow_html=True,
 )
 st.markdown(
-    "<p style='color:#9ca3af;margin-top:0;'>Enter student indicators to obtain predictions from XGBoost and HTBT, together with layered SHAP, LIME, and hybrid explanations.</p>",
+    "<p style='color:#9ca3af;margin-top:0;'>Enter key indicators for a student to obtain predictions from XGBoost and HTBT, together with SHAP, LIME, and hybrid explanations.</p>",
     unsafe_allow_html=True,
 )
 
-# ============================================
+# Load models and metadata once at app start
+xgb_model, xgb_classes, ALL_FEATURES = get_model_and_metadata()
+num_static_features = len(ALL_FEATURES)
+num_classes = len(xgb_classes)
+htbt_model = load_htbt_model(
+    n_static=num_static_features,
+    seq_len=SEQ_LEN,
+    num_classes=num_classes,
+)
+shap_explainer, lime_explainer, background_data = get_explainers(
+    xgb_model, ALL_FEATURES
+)
+
 # Layout: Left = Inputs, Right = Results & Explanations
-# ============================================
 col_left, col_right = st.columns([1.1, 1.9])
 
 # ------------------------------------------------
@@ -372,9 +421,12 @@ col_left, col_right = st.columns([1.1, 1.9])
 # ------------------------------------------------
 with col_left:
     st.markdown("<div class='section-card'>", unsafe_allow_html=True)
-    st.markdown("<div class='section-title'>📝 Student Information</div>", unsafe_allow_html=True)
     st.markdown(
-        "<div class='section-subtitle'>Adjust the indicators below to reflect a specific student profile. Default values change across sessions.</div>",
+        "<div class='section-title'>📝 Student Information</div>",
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        "<div class='section-subtitle'>Adjust the indicators below to reflect a specific student profile. Default values are regenerated on each refresh.</div>",
         unsafe_allow_html=True,
     )
 
@@ -391,18 +443,19 @@ with col_left:
                 value=float(default_val),
                 step=0.1,
                 format="%.3f",
+                key=f"static_{f}",
             )
 
         st.markdown("#### 📊 Study Activity Over Past 30 Days")
         st.caption(
-            "Daily virtual learning environment activity (e.g., number of clicks or interactions per day)."
+            "Daily virtual learning environment activity (for example, number of clicks or interactions per day)."
         )
 
         with st.expander("View / Edit 30-Day Activity Sequence"):
             for i in range(SEQ_LEN):
-                default_seq = float(np.random.randint(0, 60))
+                default_seq = float(np.random.randint(0, 80))
                 seq_val = st.number_input(
-                    f"Day {i+1} Activity",
+                    f"Day {i + 1} Activity",
                     value=default_seq,
                     min_value=0.0,
                     step=1.0,
@@ -419,21 +472,24 @@ with col_left:
 # ------------------------------------------------
 with col_right:
     st.markdown("<div class='section-card'>", unsafe_allow_html=True)
+    st.markmarkdown = st.markdown  # alias in case of accidental use elsewhere
     st.markdown(
         "<div class='section-title'>🎯 Model Predictions</div>",
         unsafe_allow_html=True,
     )
     st.markdown(
-        "<div class='section-subtitle'>Predicted outcome, risk characterisation, and confidence from XGBoost and HTBT.</div>",
+        "<div class='section-subtitle'>Predicted outcome, risk characterisation, and confidence from XGBoost and HTBT for the entered profile.</div>",
         unsafe_allow_html=True,
     )
 
     if not run_inference:
-        st.info("Enter or adjust the inputs on the left and click **“Check Results”** to generate predictions and explanations.")
+        st.info(
+            "Enter or adjust the inputs on the left and click **“Check Results”** to generate predictions and explanations."
+        )
         st.markdown("</div>", unsafe_allow_html=True)
     else:
         # -------------------------
-        # Build full feature vector
+        # Build full feature vector in model order
         # -------------------------
         x_full = np.zeros(len(ALL_FEATURES), dtype=np.float32)
         for j, fname in enumerate(ALL_FEATURES):
@@ -452,9 +508,9 @@ with col_right:
             xgb_probs, xgb_classes
         )
 
-        c_pred_top, c_pred_bottom = st.columns(2)
+        c_pred_left, c_pred_right = st.columns(2)
 
-        with c_pred_top:
+        with c_pred_left:
             st.markdown("<div class='metric-card'>", unsafe_allow_html=True)
             st.markdown(
                 "<span class='small-label'>XGBoost Predicted Outcome</span>",
@@ -483,7 +539,7 @@ with col_right:
             htbt_conf = float(np.max(probs_htbt))
             attn = htbt_model.attn_weights  # (B, heads, 1, L)
 
-        with c_pred_bottom:
+        with c_pred_right:
             st.markdown("<div class='metric-card'>", unsafe_allow_html=True)
             st.markdown(
                 "<span class='small-label'>HTBT Predicted Outcome</span>",
@@ -510,11 +566,14 @@ with col_right:
             unsafe_allow_html=True,
         )
         st.markdown(
-            "<div class='section-subtitle'>Feature-level explanations for this specific profile using SHAP, LIME, and a hybrid aggregation.</div>",
+            "<div class='section-subtitle'>Feature-level explanations for this profile using SHAP, LIME, and a hybrid aggregation.</div>",
             unsafe_allow_html=True,
         )
 
         c_shap, c_lime = st.columns(2)
+
+        shap_values_instance = None
+        lime_exp = None
 
         # -------------------------
         # SHAP local explanation
@@ -524,42 +583,43 @@ with col_right:
                 "<div class='small-label'>SHAP Feature Contributions</div>",
                 unsafe_allow_html=True,
             )
-            try:
-                shap_values_instance = shap_explainer.shap_values(xgb_input)
-                # shap_values_instance is a list (per class) for multiclass
-                if isinstance(shap_values_instance, list):
-                    shap_vals = shap_values_instance[pred_idx][0]
-                else:
-                    shap_vals = shap_values_instance[0]
+            if shap_explainer is None:
+                st.info("SHAP explainer could not be initialised in this environment.")
+            else:
+                try:
+                    shap_values_instance = shap_explainer.shap_values(xgb_input)
+                    if isinstance(shap_values_instance, list):
+                        shap_vals = shap_values_instance[pred_idx][0]
+                    else:
+                        shap_vals = shap_values_instance[0]
 
-                shap_df = pd.DataFrame(
-                    {
-                        "feature": ALL_FEATURES,
-                        "shap_value": shap_vals,
-                    }
-                )
-                # Focus display on simplified features
-                shap_df = shap_df[
-                    shap_df["feature"].isin(SIMPLIFIED_FEATURES.keys())
-                ].copy()
-                shap_df["abs_val"] = shap_df["shap_value"].abs()
-                shap_df = shap_df.sort_values("abs_val", ascending=False).head(10)
+                    shap_df = pd.DataFrame(
+                        {
+                            "feature": ALL_FEATURES,
+                            "shap_value": shap_vals,
+                        }
+                    )
+                    shap_df = shap_df[
+                        shap_df["feature"].isin(SIMPLIFIED_FEATURES.keys())
+                    ].copy()
+                    shap_df["abs_val"] = shap_df["shap_value"].abs()
+                    shap_df = shap_df.sort_values("abs_val", ascending=False).head(10)
 
-                fig, ax = plt.subplots(figsize=(5, 3))
-                sns.barplot(
-                    x="shap_value",
-                    y="feature",
-                    data=shap_df,
-                    ax=ax,
-                    palette="rocket",
-                )
-                ax.set_xlabel("SHAP value (impact on prediction)")
-                ax.set_ylabel("")
-                plt.tight_layout()
-                st.pyplot(fig)
-                plt.close(fig)
-            except Exception as e:
-                st.info(f"SHAP explanation not available: {e}")
+                    fig, ax = plt.subplots(figsize=(5, 3))
+                    sns.barplot(
+                        x="shap_value",
+                        y="feature",
+                        data=shap_df,
+                        ax=ax,
+                        palette="rocket",
+                    )
+                    ax.set_xlabel("SHAP value (impact on prediction)")
+                    ax.set_ylabel("")
+                    plt.tight_layout()
+                    st.pyplot(fig)
+                    plt.close(fig)
+                except Exception as e:
+                    st.info(f"SHAP explanation not available: {e}")
 
         # -------------------------
         # LIME local explanation
@@ -569,20 +629,23 @@ with col_right:
                 "<div class='small-label'>LIME Local Explanation</div>",
                 unsafe_allow_html=True,
             )
-            try:
-                lime_exp = lime_explainer.explain_instance(
-                    x_full,
-                    xgb_model.predict_proba,
-                    num_features=min(12, len(ALL_FEATURES)),
-                    top_labels=1,
-                )
-                fig_lime = lime_exp.as_pyplot_figure(label=pred_idx)
-                fig_lime.set_size_inches(5, 3)
-                plt.tight_layout()
-                st.pyplot(fig_lime)
-                plt.close(fig_lime)
-            except Exception as e:
-                st.info(f"LIME explanation not available: {e}")
+            if lime_explainer is None:
+                st.info("LIME explainer could not be initialised in this environment.")
+            else:
+                try:
+                    lime_exp = lime_explainer.explain_instance(
+                        x_full,
+                        xgb_model.predict_proba,
+                        num_features=min(12, len(ALL_FEATURES)),
+                        top_labels=1,
+                    )
+                    fig_lime = lime_exp.as_pyplot_figure(label=pred_idx)
+                    fig_lime.set_size_inches(5, 3)
+                    plt.tight_layout()
+                    st.pyplot(fig_lime)
+                    plt.close(fig_lime)
+                except Exception as e:
+                    st.info(f"LIME explanation not available: {e}")
 
         # -------------------------
         # Hybrid SHAP + LIME
@@ -592,60 +655,62 @@ with col_right:
             "<div class='small-label'>Hybrid SHAP + LIME Explanation</div>",
             unsafe_allow_html=True,
         )
-        try:
-            # SHAP importance vector
-            if isinstance(shap_values_instance, list):
-                shap_vals = shap_values_instance[pred_idx][0]
-            else:
-                shap_vals = shap_values_instance[0]
-            shap_imp = np.abs(shap_vals)
-            shap_imp_norm = shap_imp / (shap_imp.sum() + 1e-9)
-
-            # LIME importance vector (per feature index)
-            lime_local = dict(lime_exp.local_exp[pred_idx])
-            lime_imp = np.zeros_like(shap_imp, dtype=float)
-            for idx, weight in lime_local.items():
-                if 0 <= idx < len(lime_imp):
-                    lime_imp[idx] = abs(weight)
-            lime_imp_norm = lime_imp / (lime_imp.sum() + 1e-9)
-
-            # Hybrid: simple average
-            hybrid_score = 0.5 * shap_imp_norm + 0.5 * lime_imp_norm
-
-            hybrid_df = pd.DataFrame(
-                {
-                    "feature": ALL_FEATURES,
-                    "hybrid_score": hybrid_score,
-                    "shap_norm": shap_imp_norm,
-                    "lime_norm": lime_imp_norm,
-                }
+        if shap_values_instance is None or lime_exp is None:
+            st.info(
+                "Hybrid explanation requires both SHAP and LIME to be available for this profile."
             )
-            hybrid_df = hybrid_df[
-                hybrid_df["feature"].isin(SIMPLIFIED_FEATURES.keys())
-            ].copy()
-            hybrid_df = hybrid_df.sort_values(
-                "hybrid_score", ascending=False
-            ).head(10)
+        else:
+            try:
+                if isinstance(shap_values_instance, list):
+                    shap_vals = shap_values_instance[pred_idx][0]
+                else:
+                    shap_vals = shap_values_instance[0]
+                shap_imp = np.abs(shap_vals)
+                shap_imp_norm = shap_imp / (shap_imp.sum() + 1e-9)
 
-            fig_h, ax_h = plt.subplots(figsize=(6, 3))
-            sns.barplot(
-                x="hybrid_score",
-                y="feature",
-                data=hybrid_df,
-                ax=ax_h,
-                palette="mako",
-            )
-            ax_h.set_xlabel("Hybrid importance (SHAP + LIME, normalised)")
-            ax_h.set_ylabel("")
-            plt.tight_layout()
-            st.pyplot(fig_h)
-            plt.close(fig_h)
+                lime_local = dict(lime_exp.local_exp[pred_idx])
+                lime_imp = np.zeros_like(shap_imp, dtype=float)
+                for idx, weight in lime_local.items():
+                    if 0 <= idx < len(lime_imp):
+                        lime_imp[idx] = abs(weight)
+                lime_imp_norm = lime_imp / (lime_imp.sum() + 1e-9)
 
-            st.caption(
-                "The hybrid importance score averages normalised SHAP and LIME contributions, encouraging agreement between model-consistent and perturbed local explanations."
-            )
-        except Exception as e:
-            st.info(f"Hybrid explanation not available: {e}")
+                hybrid_score = 0.5 * shap_imp_norm + 0.5 * lime_imp_norm
+
+                hybrid_df = pd.DataFrame(
+                    {
+                        "feature": ALL_FEATURES,
+                        "hybrid_score": hybrid_score,
+                        "shap_norm": shap_imp_norm,
+                        "lime_norm": lime_imp_norm,
+                    }
+                )
+                hybrid_df = hybrid_df[
+                    hybrid_df["feature"].isin(SIMPLIFIED_FEATURES.keys())
+                ].copy()
+                hybrid_df = hybrid_df.sort_values(
+                    "hybrid_score", ascending=False
+                ).head(10)
+
+                fig_h, ax_h = plt.subplots(figsize=(6, 3))
+                sns.barplot(
+                    x="hybrid_score",
+                    y="feature",
+                    data=hybrid_df,
+                    ax=ax_h,
+                    palette="mako",
+                )
+                ax_h.set_xlabel("Hybrid importance (SHAP + LIME, normalised)")
+                ax_h.set_ylabel("")
+                plt.tight_layout()
+                st.pyplot(fig_h)
+                plt.close(fig_h)
+
+                st.caption(
+                    "The hybrid importance score averages normalised SHAP and LIME contributions, highlighting features where both methods agree on influence."
+                )
+            except Exception as e:
+                st.info(f"Hybrid explanation not available: {e}")
 
         st.markdown("</div>", unsafe_allow_html=True)
 
@@ -690,7 +755,7 @@ with col_right:
                     "Higher attention weights indicate days that were particularly influential for the HTBT prediction, given the entered activity pattern."
                 )
             else:
-                st.info("Attention weights not available from the HTBT model.")
+                st.info("Attention weights are not available from the HTBT model.")
         except Exception as e:
             st.info(f"Could not visualise HTBT attention: {e}")
 
