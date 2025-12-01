@@ -1,5 +1,6 @@
 streamlit
 pandas
+xgboost
 numpy
 matplotlib==3.7.1
 seaborn==0.12.2
