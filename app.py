@@ -1,7 +1,6 @@
 import math
 import numpy as np
 import pandas as pd
-import joblib
 import torch
 import torch.nn as nn
 import streamlit as st
@@ -98,6 +97,13 @@ CUSTOM_CSS = """
 </style>
 """
 st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
+
+# ============================================
+# HTBT constants (from training setup)
+# ============================================
+HTBT_N_STATIC = 33       # number of static features in training
+HTBT_NUM_CLASSES = 4     # Fail / Withdrawn / Pass / Distinction
+SEQ_LEN = 30             # sequence length used in HTBT training
 
 # ============================================
 # HTBT Architecture (inference)
@@ -236,8 +242,6 @@ SIMPLIFIED_FEATURES = OrderedDict(
     ]
 )
 
-SEQ_LEN = 30  # 30-day temporal window
-
 
 def random_default(feature_name: str) -> float:
     """
@@ -315,21 +319,30 @@ def load_xgb_model():
 
 
 @st.cache_resource
-def load_htbt_model(n_static, seq_len, num_classes):
+def load_htbt_model():
+    """
+    Load HTBT with the exact architecture used in training.
+    If the state dict is incompatible, return None gracefully.
+    """
     model = HTBT(
-        n_static=n_static,
-        seq_len=seq_len,
+        n_static=HTBT_N_STATIC,
+        seq_len=SEQ_LEN,
         d_model=128,
         n_heads=4,
         n_layers=3,
         d_ff=256,
         dropout=0.1,
-        num_classes=num_classes,
+        num_classes=HTBT_NUM_CLASSES,
     )
-    state_dict = torch.load("htbt_best.pt", map_location="cpu")
-    model.load_state_dict(state_dict)
-    model.eval()
-    return model
+    try:
+        state_dict = torch.load("htbt_best.pt", map_location="cpu")
+        model.load_state_dict(state_dict)
+        model.eval()
+        return model
+    except Exception as e:
+        # In Streamlit Cloud this will only print to logs, UI handled below
+        print("HTBT load_state_dict failed:", repr(e))
+        return None
 
 
 @st.cache_resource
@@ -344,7 +357,7 @@ def get_model_and_metadata():
         xgb_classes = xgb_model.classes_
     else:
         # Fallback to 4 ordered classes if metadata are missing
-        xgb_classes = np.arange(4)
+        xgb_classes = np.arange(HTBT_NUM_CLASSES)
 
     # Determine feature names as used in training
     booster = xgb_model.get_booster()
@@ -378,7 +391,7 @@ def get_explainers(xgb_model, all_features):
         lime_explainer = LimeTabularExplainer(
             training_data=background,
             feature_names=all_features,
-            class_names=[str(c) for c in getattr(xgb_model, "classes_", np.arange(4))],
+            class_names=[str(c) for c in getattr(xgb_model, "classes_", np.arange(HTBT_NUM_CLASSES))],
             discretize_continuous=True,
             random_state=42,
         )
@@ -404,11 +417,7 @@ st.markdown(
 xgb_model, xgb_classes, ALL_FEATURES = get_model_and_metadata()
 num_static_features = len(ALL_FEATURES)
 num_classes = len(xgb_classes)
-htbt_model = load_htbt_model(
-    n_static=num_static_features,
-    seq_len=SEQ_LEN,
-    num_classes=num_classes,
-)
+htbt_model = load_htbt_model()
 shap_explainer, lime_explainer, background_data = get_explainers(
     xgb_model, ALL_FEATURES
 )
@@ -472,7 +481,6 @@ with col_left:
 # ------------------------------------------------
 with col_right:
     st.markdown("<div class='section-card'>", unsafe_allow_html=True)
-    st.markmarkdown = st.markdown  # alias in case of accidental use elsewhere
     st.markdown(
         "<div class='section-title'>🎯 Model Predictions</div>",
         unsafe_allow_html=True,
@@ -489,7 +497,7 @@ with col_right:
         st.markdown("</div>", unsafe_allow_html=True)
     else:
         # -------------------------
-        # Build full feature vector in model order
+        # Build full XGBoost feature vector in model order
         # -------------------------
         x_full = np.zeros(len(ALL_FEATURES), dtype=np.float32)
         for j, fname in enumerate(ALL_FEATURES):
@@ -527,33 +535,59 @@ with col_right:
             st.markdown("</div>", unsafe_allow_html=True)
 
         # -------------------------
-        # HTBT prediction & attention
+        # HTBT prediction & attention (if model loaded)
         # -------------------------
-        static_tensor = torch.tensor(x_full.reshape(1, -1), dtype=torch.float32)
-        seq_tensor = torch.tensor(seq_inputs, dtype=torch.float32).unsqueeze(0)
+        if htbt_model is not None:
+            # Build static vector of length HTBT_N_STATIC
+            htbt_static = np.zeros(HTBT_N_STATIC, dtype=np.float32)
+            simplified_keys = list(SIMPLIFIED_FEATURES.keys())
+            for i, f in enumerate(simplified_keys):
+                if i < HTBT_N_STATIC:
+                    htbt_static[i] = float(static_inputs[f])
 
-        with torch.no_grad():
-            logits_htbt, _, _ = htbt_model(static_tensor, seq_tensor)
-            probs_htbt = torch.softmax(logits_htbt, dim=1).cpu().numpy()[0]
-            htbt_pred_idx = int(np.argmax(probs_htbt))
-            htbt_conf = float(np.max(probs_htbt))
-            attn = htbt_model.attn_weights  # (B, heads, 1, L)
+            static_tensor = torch.tensor(
+                htbt_static.reshape(1, -1), dtype=torch.float32
+            )
+            seq_tensor = torch.tensor(seq_inputs, dtype=torch.float32).unsqueeze(0)
 
-        with c_pred_right:
-            st.markdown("<div class='metric-card'>", unsafe_allow_html=True)
-            st.markdown(
-                "<span class='small-label'>HTBT Predicted Outcome</span>",
-                unsafe_allow_html=True,
-            )
-            st.markdown(
-                f"<h3 style='margin-top:0.25rem;'>Class {int(xgb_classes[htbt_pred_idx])}</h3>",
-                unsafe_allow_html=True,
-            )
-            st.markdown(
-                f"<span class='risk-pill risk-low'>Confidence · {htbt_conf*100:.1f}%</span>",
-                unsafe_allow_html=True,
-            )
-            st.markdown("</div>", unsafe_allow_html=True)
+            with torch.no_grad():
+                logits_htbt, _, _ = htbt_model(static_tensor, seq_tensor)
+                probs_htbt = torch.softmax(logits_htbt, dim=1).cpu().numpy()[0]
+                htbt_pred_idx = int(np.argmax(probs_htbt))
+                htbt_conf = float(np.max(probs_htbt))
+                attn = htbt_model.attn_weights  # (B, heads, 1, L)
+
+            with c_pred_right:
+                st.markdown("<div class='metric-card'>", unsafe_allow_html=True)
+                st.markdown(
+                    "<span class='small-label'>HTBT Predicted Outcome</span>",
+                    unsafe_allow_html=True,
+                )
+                st.markdown(
+                    f"<h3 style='margin-top:0.25rem;'>Class {int(xgb_classes[htbt_pred_idx])}</h3>",
+                    unsafe_allow_html=True,
+                )
+                st.markdown(
+                    f"<span class='risk-pill risk-low'>Confidence · {htbt_conf*100:.1f}%</span>",
+                    unsafe_allow_html=True,
+                )
+                st.markdown("</div>", unsafe_allow_html=True)
+        else:
+            with c_pred_right:
+                st.markdown("<div class='metric-card'>", unsafe_allow_html=True)
+                st.markdown(
+                    "<span class='small-label'>HTBT Predicted Outcome</span>",
+                    unsafe_allow_html=True,
+                )
+                st.markdown(
+                    "<h3 style='margin-top:0.25rem;'>Not available</h3>",
+                    unsafe_allow_html=True,
+                )
+                st.markdown(
+                    "<span class='risk-pill risk-med'>HTBT model could not be loaded in this deployment.</span>",
+                    unsafe_allow_html=True,
+                )
+                st.markdown("</div>", unsafe_allow_html=True)
 
         st.markdown("</div>", unsafe_allow_html=True)
 
@@ -727,8 +761,9 @@ with col_right:
             unsafe_allow_html=True,
         )
 
-        try:
-            if attn is not None:
+        if htbt_model is not None and htbt_model.attn_weights is not None:
+            try:
+                attn = htbt_model.attn_weights
                 # attn: (B, heads, 1, L)
                 attn_np = (
                     attn.mean(dim=1)
@@ -754,10 +789,12 @@ with col_right:
                 st.caption(
                     "Higher attention weights indicate days that were particularly influential for the HTBT prediction, given the entered activity pattern."
                 )
-            else:
-                st.info("Attention weights are not available from the HTBT model.")
-        except Exception as e:
-            st.info(f"Could not visualise HTBT attention: {e}")
+            except Exception as e:
+                st.info(f"Could not visualise HTBT attention: {e}")
+        else:
+            st.info(
+                "HTBT attention visualisation is not available because the model or its attention weights could not be retrieved."
+            )
 
         st.markdown("</div>", unsafe_allow_html=True)
 
