@@ -318,7 +318,10 @@ def sample_background(all_feature_names, n_samples=300):
 # ============================================
 # Load models & set up explainers
 # ============================================
-xgb_model = load_xgb_model()
+def load_xgb_model():
+    model = xgb.XGBClassifier()
+    model.load_model("xgb_final.json")
+    return model
 xgb_classes = getattr(xgb_model, "classes_", np.arange(4))
 
 # Full static feature list as seen by the model
