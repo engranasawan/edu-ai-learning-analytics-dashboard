@@ -1,7 +1,8 @@
 streamlit
 pandas
 numpy
-matplotlib
+matplotlib==3.7.1
+seaborn==0.12.2
 joblib
 torch
 scikit-learn
