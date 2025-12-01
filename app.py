@@ -216,7 +216,8 @@ class HTBT(nn.Module):
 # ============================================
 @st.cache_resource
 def load_xgb_model():
-    model = joblib.load("xgb_final.joblib")
+    model = xgb.XGBClassifier()
+    model.load_model("xgb_final.json")
     return model
 
 
